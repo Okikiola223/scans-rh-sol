@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Launch feed for Solana + Robinhood Chain with structural rug filters.
+"""Launch feed: Ethereum, BNB, Robinhood.
 
-Solana: RugCheck new tokens + full report.
-Robinhood: GeckoTerminal new pools + GoPlus when the token is indexed.
+GeckoTerminal new pools + GoPlus + DexScreener paid + $50k market cap.
+Also pings Telegram when watched wallets buy a token that clears the same filter.
 
-This hides kill switches (mint, freeze, honeypot, hidden owner). It does not
-prove a token is safe. Devs still dump. Default prints PASSES only.
+This does not auto-buy. A pass is not “safe.”
 """
 
 from __future__ import annotations
@@ -21,25 +20,71 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-UA = "launch-feed/0.1 (+local)"
-RUGCHECK_NEW = "https://api.rugcheck.xyz/v1/stats/new_tokens"
-RUGCHECK_REPORT = "https://api.rugcheck.xyz/v1/tokens/{mint}/report"
+UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 GECKO_NEW = "https://api.geckoterminal.com/api/v2/networks/{net}/new_pools?include=base_token,quote_token"
-GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/4663?contract_addresses={addr}"
+GOPLUS = "https://api.gopluslabs.io/api/v1/token_security/{cid}?contract_addresses={addr}"
+DEX_ORDERS = "https://api.dexscreener.com/orders/v1/{chain}/{token}"
+DEX_TOKEN = "https://api.dexscreener.com/latest/dex/tokens/{token}"
+
+DEFAULT_WATCH = [
+    "0x5a52d4b820ae7f02880d270562950918acb14aa2",
+    "0xdc0aa7c3205fe9c6b077522c5ca1acc4599af0d2",
+]
+MIN_MC = 50_000
+OFFICIAL_ISSUER = "0x4783c67b63de2b358ac5951a7d41f47a38f3c046"
 
 FAKE = {
-    "SOL", "BTC", "ETH", "WETH", "USDC", "USDT", "USDG", "BONK", "JUP", "JITO",
-    "TRUMP", "MELANIA", "DOGE", "PEPE", "WIF", "PENGU", "HYPE",
+    "BTC", "ETH", "WETH", "WBNB", "BNB", "USDC", "USDT", "USDG", "DAI", "BUSD",
+    "WBTC", "STETH", "TRUMP", "DOGE", "PEPE", "SOL",
 }
 
-RH_SKIP = {
-    "0x0bd7d308f8e1639fab988df18a8011f41eacad73",  # WETH
-    "0x5fc5360d0400a0fd4f2af552add042d716f1d168",  # USDG
-    "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-    "0x4783c67b63de2b358ac5951a7d41f47a38f3c046",  # official stock issuer
+CHAINS = {
+    "ethereum": {
+        "gecko": "eth",
+        "dex": "ethereum",
+        "goplus": 1,
+        "skip": {
+            "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",  # WETH
+            "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",  # USDC
+            "0xdac17f958d2ee523a2206206994597c13d831ec7",  # USDT
+            "0x6b175474e89094c44da98b954eedeac495271d0f",  # DAI
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        },
+        "explorer": "https://etherscan.io/token/{token}",
+        "xfers": "https://eth.blockscout.com/api/v2/addresses/{addr}/token-transfers?type=ERC-20",
+    },
+    "bsc": {
+        "gecko": "bsc",
+        "dex": "bsc",
+        "goplus": 56,
+        "skip": {
+            "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c",  # WBNB
+            "0x55d398326f99059ff775485246999027b3197955",  # USDT
+            "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d",  # USDC
+            "0xe9e7cea3dedca5984780bafc599bd69add087d56",  # BUSD
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        },
+        "explorer": "https://bscscan.com/token/{token}",
+        "xfers": "https://bsc.blockscout.com/api/v2/addresses/{addr}/token-transfers?type=ERC-20",
+    },
+    "robinhood": {
+        "gecko": "robinhood",
+        "dex": "robinhood",
+        "goplus": 4663,
+        "skip": {
+            "0x0bd7d308f8e1639fab988df18a8011f41eacad73",
+            "0x5fc5360d0400a0fd4f2af552add042d716f1d168",
+            "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "0x4783c67b63de2b358ac5951a7d41f47a38f3c046",
+        },
+        "explorer": "https://robinhoodchain.blockscout.com/token/{token}",
+        "xfers": "https://robinhoodchain.blockscout.com/api/v2/addresses/{addr}/token-transfers?type=ERC-20",
+    },
 }
 
-OFFICIAL_ISSUER = "0x4783c67b63de2b358ac5951a7d41f47a38f3c046"
 SEEN_PATH = Path(__file__).resolve().parent / "seen.json"
 SEEN_CAP = 8000
 
@@ -88,13 +133,6 @@ def http_json(url: str, timeout: float = 20.0, data: bytes | None = None) -> Any
         return json.loads(r.read().decode())
 
 
-def empty_auth(v: Any) -> bool:
-    if v is None:
-        return True
-    s = str(v).strip()
-    return s in ("", "null", "11111111111111111111111111111111", "None")
-
-
 def fnum(x: Any, default: float = 0.0) -> float:
     try:
         if x is None or x == "":
@@ -105,125 +143,46 @@ def fnum(x: Any, default: float = 0.0) -> float:
 
 
 def fake_ticker(sym: str) -> bool:
-    s = (sym or "").strip().upper()
-    return s in FAKE
+    return (sym or "").strip().upper() in FAKE
 
 
-# --- Solana -----------------------------------------------------------------
-
-
-def sol_prefilter(row: dict) -> str | None:
-    if not empty_auth(row.get("mintAuthority")):
-        return "mint authority live"
-    if not empty_auth(row.get("freezeAuthority")):
-        return "freeze authority live"
-    if fake_ticker(row.get("symbol") or ""):
-        return f"ticker looks cloned ({row.get('symbol')})"
-    return None
-
-
-def market_addrs(report: dict) -> set[str]:
-    out: set[str] = set()
-    for m in report.get("markets") or []:
-        for k in ("pubkey", "mintLP", "liquidityA", "liquidityB"):
-            v = m.get(k)
-            if v:
-                out.add(v)
-    known = report.get("knownAccounts") or {}
-    if isinstance(known, dict):
-        out.update(known.keys())
-    return out
-
-
-def insider_pct(report: dict) -> float:
-    skip = market_addrs(report)
-    total = 0.0
-    for h in report.get("topHolders") or []:
-        if (h.get("address") in skip) or (h.get("owner") in skip):
-            continue
-        total += fnum(h.get("pct"))
-    return total
-
-
-def sol_report_fail(report: dict, holders_min: int, insider_max: float) -> str | None:
-    if report.get("rugged"):
-        return "marked rugged"
-    if not empty_auth(report.get("mintAuthority") or (report.get("token") or {}).get("mintAuthority")):
-        return "mint authority live"
-    if not empty_auth(report.get("freezeAuthority") or (report.get("token") or {}).get("freezeAuthority")):
-        return "freeze authority live"
-    for risk in report.get("risks") or []:
-        lvl = str(risk.get("level") or "").lower()
-        if lvl in {"danger", "critical"}:
-            return f"danger: {risk.get('name') or risk.get('description')}"
-    n = int(report.get("totalHolders") or 0)
-    if n >= holders_min:
-        pct = insider_pct(report)
-        if pct >= insider_max:
-            return f"non-LP top wallets {pct:.0f}%"
-    return None
-
-
-def pull_solana(limit: int, holders_min: int, insider_max: float, show_rejects: bool) -> list[dict]:
-    print("Solana: RugCheck new tokens")
+def dex_paid_mc(dex_chain: str, token: str, min_mc: float) -> tuple[str | None, dict]:
+    info = {"paid": False, "mc": 0.0, "kind": ""}
     try:
-        rows = http_json(RUGCHECK_NEW)
-    except Exception as e:
-        print(f"  fetch failed: {e}")
-        return []
-    if not isinstance(rows, list):
-        print("  unexpected payload")
-        return []
-
-    candidates = []
-    for row in rows:
-        why = sol_prefilter(row)
-        if why:
-            if show_rejects:
-                print(f"  skip {row.get('symbol') or row.get('mint')}: {why}")
+        raw = http_json(DEX_ORDERS.format(chain=dex_chain, token=token))
+    except Exception:
+        raw = {}
+    orders = raw if isinstance(raw, list) else (raw.get("orders") or [])
+    boosts = [] if isinstance(raw, list) else (raw.get("boosts") or [])
+    for o in orders:
+        st = str(o.get("status") or "").lower()
+        if st in {"cancelled", "rejected", "failed"}:
             continue
-        candidates.append(row)
-        if len(candidates) >= limit:
+        if o.get("paymentTimestamp") or st in {"approved", "on-hold", "processing", "pending"}:
+            info["paid"] = True
+            info["kind"] = str(o.get("type") or "order")
             break
-
-    passed = []
-    for i, row in enumerate(candidates):
-        mint = row.get("mint")
-        if i:
-            time.sleep(1.15)
-        try:
-            report = http_json(RUGCHECK_REPORT.format(mint=mint))
-        except Exception as e:
-            if show_rejects:
-                print(f"  skip {row.get('symbol')}: report failed ({e})")
-            continue
-        why = sol_report_fail(report, holders_min, insider_max)
-        if why:
-            if show_rejects:
-                print(f"  skip {row.get('symbol') or mint}: {why}")
-            continue
-        passed.append(
-            {
-                "chain": "solana",
-                "symbol": (report.get("tokenMeta") or {}).get("symbol") or row.get("symbol"),
-                "name": (report.get("tokenMeta") or {}).get("name") or "",
-                "token": mint,
-                "launchpad": (
-                    (report.get("launchpad") or {}).get("name")
-                    if isinstance(report.get("launchpad"), dict)
-                    else (report.get("launchpad") or report.get("deployPlatform") or "")
-                ),
-                "holders": report.get("totalHolders"),
-                "liq": report.get("totalMarketLiquidity"),
-                "note": "mint/freeze off",
-                "url": f"https://rugcheck.xyz/tokens/{mint}",
-                "dex": f"https://dexscreener.com/solana/{mint}",
-            }
-        )
-    return passed
-
-
-# --- Robinhood Chain --------------------------------------------------------
+    if not info["paid"]:
+        for b in boosts:
+            if fnum(b.get("amount")) > 0 or fnum(b.get("totalAmount")) > 0:
+                info["paid"] = True
+                info["kind"] = "boost"
+                break
+    try:
+        pairs = http_json(DEX_TOKEN.format(token=token)).get("pairs") or []
+        same = [p for p in pairs if str(p.get("chainId") or "") == dex_chain]
+        use = same or pairs
+        mc = 0.0
+        for p in use:
+            mc = max(mc, fnum(p.get("marketCap")), fnum(p.get("fdv")))
+        info["mc"] = mc
+    except Exception:
+        pass
+    if not info["paid"]:
+        return "dex not paid", info
+    if info["mc"] < min_mc:
+        return f"mc ${info['mc']:,.0f} < ${min_mc:,.0f}", info
+    return None, info
 
 
 def gecko_new(net: str) -> tuple[list[dict], dict[str, dict]]:
@@ -235,9 +194,9 @@ def gecko_new(net: str) -> tuple[list[dict], dict[str, dict]]:
     return data.get("data") or [], tokens
 
 
-def goplus(addr: str) -> dict:
+def goplus(cid: int, addr: str) -> dict:
     try:
-        data = http_json(GOPLUS.format(addr=addr.lower()))
+        data = http_json(GOPLUS.format(cid=cid, addr=addr.lower()))
     except Exception:
         return {}
     result = data.get("result") or {}
@@ -246,9 +205,9 @@ def goplus(addr: str) -> dict:
     return result.get(addr.lower()) or {}
 
 
-def rh_goplus_fail(g: dict) -> str | None:
+def goplus_fail(g: dict, chain_key: str) -> str | None:
     if not g:
-        return None  # not indexed yet; other filters still run
+        return None
     def flag(key: str) -> bool:
         return str(g.get(key) or "0") in {"1", "true", "True"}
 
@@ -266,27 +225,26 @@ def rh_goplus_fail(g: dict) -> str | None:
         return "owner can take it back"
     if flag("honeypot_with_same_creator"):
         return "same creator honeypot"
-    buy = fnum(g.get("buy_tax"))
-    sell = fnum(g.get("sell_tax"))
+    buy, sell = fnum(g.get("buy_tax")), fnum(g.get("sell_tax"))
     if buy >= 10 or sell >= 10:
         return f"tax buy {buy}% sell {sell}%"
-    owner_pct = fnum(g.get("owner_percent")) * (100.0 if fnum(g.get("owner_percent")) <= 1 else 1)
-    # GoPlus owner_percent is often a fraction 0-1
     raw = g.get("owner_percent")
     op = fnum(raw)
     if raw not in (None, "") and op <= 1:
         op *= 100
     if op >= 30:
         return f"owner holds {op:.0f}%"
-    creator = (g.get("creator_address") or "").lower()
-    if creator == OFFICIAL_ISSUER:
-        return "official stock issuer"
+    if chain_key == "robinhood":
+        creator = (g.get("creator_address") or "").lower()
+        if creator == OFFICIAL_ISSUER:
+            return "official stock issuer"
     return None
 
 
-def rh_pool_fail(attrs: dict, tok: dict, min_liq: float) -> str | None:
+def pool_fail(chain_key: str, attrs: dict, tok: dict, min_liq: float) -> str | None:
+    cfg = CHAINS[chain_key]
     addr = (tok.get("address") or "").lower()
-    if addr in RH_SKIP:
+    if addr in cfg["skip"]:
         return "infra / quote token"
     if fake_ticker(tok.get("symbol") or ""):
         return f"ticker looks cloned ({tok.get('symbol')})"
@@ -296,22 +254,22 @@ def rh_pool_fail(attrs: dict, tok: dict, min_liq: float) -> str | None:
     tx = (attrs.get("transactions") or {}).get("h1") or {}
     buys = int(tx.get("buys") or 0)
     sells = int(tx.get("sells") or 0)
-    # lots of buys and zero sells is the cheap honeypot signature, once there is flow
     if buys >= 8 and sells == 0:
         return "buys with zero sells"
     return None
 
 
-def pull_robinhood(limit: int, min_liq: float, show_rejects: bool) -> list[dict]:
-    print("Robinhood: GeckoTerminal new pools + GoPlus")
+def pull_chain(chain_key: str, limit: int, min_liq: float, show_rejects: bool, min_mc: float) -> list[dict]:
+    cfg = CHAINS[chain_key]
+    print(f"{chain_key}: new pools")
     try:
-        pools, tokens = gecko_new("robinhood")
+        pools, tokens = gecko_new(cfg["gecko"])
     except Exception as e:
         print(f"  fetch failed: {e}")
         return []
 
     seen: set[str] = set()
-    passed = []
+    passed: list[dict] = []
     for pool in pools:
         if len(passed) >= limit:
             break
@@ -322,38 +280,96 @@ def pull_robinhood(limit: int, min_liq: float, show_rejects: bool) -> list[dict]
             continue
         seen.add(addr)
         attrs = pool.get("attributes") or {}
-        why = rh_pool_fail(attrs, tok, min_liq)
+        why = pool_fail(chain_key, attrs, tok, min_liq)
         if why:
             if show_rejects:
                 print(f"  skip {tok.get('symbol') or addr}: {why}")
             continue
-        g = goplus(addr)
-        why = rh_goplus_fail(g)
+        g = goplus(cfg["goplus"], addr)
+        why = goplus_fail(g, chain_key)
         if why:
             if show_rejects:
                 print(f"  skip {tok.get('symbol') or addr}: {why}")
             continue
-        scan = "goplus clean" if g else "goplus not indexed yet"
+        why, dinfo = dex_paid_mc(cfg["dex"], addr, min_mc)
+        if why:
+            if show_rejects:
+                print(f"  skip {tok.get('symbol') or addr}: {why}")
+            continue
         dex_id = (((pool.get("relationships") or {}).get("dex") or {}).get("data") or {}).get("id") or ""
         passed.append(
             {
-                "chain": "robinhood",
+                "chain": chain_key,
                 "symbol": tok.get("symbol") or "",
                 "name": tok.get("name") or "",
                 "token": addr,
                 "launchpad": dex_id,
                 "holders": (g or {}).get("holder_count"),
                 "liq": attrs.get("reserve_in_usd"),
-                "note": scan,
-                "url": f"https://robinhoodchain.blockscout.com/token/{addr}",
-                "dex": f"https://dexscreener.com/robinhood/{addr}",
+                "mc": dinfo["mc"],
+                "note": f"paid {dinfo['kind']} mc ${dinfo['mc']:,.0f}",
+                "url": cfg["explorer"].format(token=addr),
+                "dex": f"https://dexscreener.com/{cfg['dex']}/{addr}",
             }
         )
         time.sleep(0.25)
     return passed
 
 
-# --- print ------------------------------------------------------------------
+def watch_wallets(show_rejects: bool, min_mc: float, chain_keys: list[str]) -> list[dict]:
+    raw = os.environ.get("WATCH_WALLETS") or ",".join(DEFAULT_WATCH)
+    wallets = [w.strip().lower() for w in raw.split(",") if w.strip()]
+    if not wallets:
+        return []
+    print(f"Wallets: {len(wallets)} on {', '.join(chain_keys)}")
+    hits: list[dict] = []
+    for chain_key in chain_keys:
+        cfg = CHAINS[chain_key]
+        for w in wallets:
+            try:
+                data = http_json(cfg["xfers"].format(addr=w))
+            except Exception as e:
+                print(f"  {chain_key} {w[:8]} fetch failed: {e}")
+                continue
+            items = data.get("items") or []
+            seen_tok: set[str] = set()
+            for it in items:
+                to = ((it.get("to") or {}).get("hash") or "").lower()
+                if to != w:
+                    continue
+                token = (
+                    (it.get("token") or {}).get("address_hash")
+                    or (it.get("token") or {}).get("address")
+                    or ""
+                ).lower()
+                if not token or token in cfg["skip"] or token in seen_tok:
+                    continue
+                seen_tok.add(token)
+                sym = (it.get("token") or {}).get("symbol") or "?"
+                why, dinfo = dex_paid_mc(cfg["dex"], token, min_mc)
+                if why:
+                    if show_rejects:
+                        print(f"  skip {sym} {chain_key} from {w[:8]}: {why}")
+                    continue
+                hits.append(
+                    {
+                        "chain": chain_key,
+                        "symbol": sym,
+                        "name": (it.get("token") or {}).get("name") or "",
+                        "token": token,
+                        "wallet": w,
+                        "launchpad": "wallet",
+                        "holders": "-",
+                        "liq": None,
+                        "mc": dinfo["mc"],
+                        "note": f"{w[:8]}… bought · paid {dinfo['kind']}",
+                        "url": cfg["explorer"].format(token=token),
+                        "dex": f"https://dexscreener.com/{cfg['dex']}/{token}",
+                    }
+                )
+                time.sleep(0.2)
+            time.sleep(0.15)
+    return hits
 
 
 def fmt_row(r: dict) -> str:
@@ -378,11 +394,20 @@ def tg_text(r: dict) -> str:
         liq_s = f"${float(liq):,.0f}" if liq not in (None, "") else "-"
     except (TypeError, ValueError):
         liq_s = str(liq)
+    mc = r.get("mc")
+    try:
+        mc_s = f"${float(mc):,.0f}" if mc not in (None, "") else "-"
+    except (TypeError, ValueError):
+        mc_s = "-"
     pad = r.get("launchpad") or "-"
+    who = r.get("wallet")
+    head = f"{r.get('chain')}  {r.get('symbol') or '?'}"
+    if who:
+        head = f"WALLET BUY  {who[:8]}…  {head}"
     return (
-        f"{r.get('chain')}  {r.get('symbol') or '?'}\n"
+        f"{head}\n"
         f"{r.get('note') or ''}\n"
-        f"liq {liq_s}  holders {r.get('holders') or '-'}  {pad}\n"
+        f"mc {mc_s}  liq {liq_s}  {pad}\n"
         f"{r.get('dex')}\n"
         f"{r.get('token')}"
     )
@@ -398,7 +423,7 @@ def tg_send(token: str, chat_id: str, text: str) -> None:
 
 def print_table(rows: list[dict]) -> None:
     if not rows:
-        print("No passes. That is normal. Loosen with --loose or --show-rejects to see why.")
+        print("No passes. That is normal. Dex paid + $50k MC is a tight cut.")
         return
     print()
     print(f"{'CHAIN':<10} {'SYMBOL':<12} {'HOLD':<6} {'LIQ':<10} {'PAD':<16} {'NOTE':<28} DEX")
@@ -408,16 +433,28 @@ def print_table(rows: list[dict]) -> None:
         print(f"{'':10} {r.get('token')}")
 
 
+def resolve_chains(choice: str) -> list[str]:
+    if choice == "all":
+        return ["ethereum", "bsc", "robinhood"]
+    if choice == "eth":
+        return ["ethereum"]
+    if choice == "bnb":
+        return ["bsc"]
+    if choice == "rh":
+        return ["robinhood"]
+    return [choice]
+
+
 def main() -> int:
     load_env()
-    ap = argparse.ArgumentParser(description="Solana + Robinhood launch feed with rug filters")
-    ap.add_argument("--chain", choices=["sol", "rh", "both"], default="both")
+    ap = argparse.ArgumentParser(description="ETH + BNB + Robinhood launch feed")
+    ap.add_argument("--chain", choices=["eth", "bnb", "rh", "all"], default="all")
     ap.add_argument("--limit", type=int, default=12, help="max reports per chain")
     ap.add_argument("--show-rejects", action="store_true")
-    ap.add_argument("--loose", action="store_true", help="weaker holder/liq cuts")
-    ap.add_argument("--watch", action="store_true", help="loop; send new passes to Telegram if .env is set")
-    ap.add_argument("--interval", type=int, default=60, help="seconds between watches")
-    ap.add_argument("--tg-test", action="store_true", help="send one test message to Telegram and exit")
+    ap.add_argument("--loose", action="store_true", help="weaker liq cut (Dex paid + $50k still apply)")
+    ap.add_argument("--watch", action="store_true")
+    ap.add_argument("--interval", type=int, default=60)
+    ap.add_argument("--tg-test", action="store_true")
     args = ap.parse_args()
 
     tg_token = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
@@ -432,30 +469,34 @@ def main() -> int:
         print("Test sent. Check Telegram.")
         return 0
 
-    holders_min = 8 if args.loose else 15
-    insider_max = 50.0 if args.loose else 35.0
     min_liq = 0.0 if args.loose else 200.0
+    min_mc = MIN_MC
+    chain_keys = resolve_chains(args.chain)
 
     seen = load_seen()
     seeded = bool(seen)
 
+    def row_key(r: dict) -> str:
+        if r.get("wallet"):
+            return f"w:{r['chain']}:{r['wallet']}:{r['token']}"
+        return f"{r['chain']}:{r['token']}"
+
     def once() -> None:
         nonlocal seen, seeded
         rows: list[dict] = []
-        if args.chain in {"sol", "both"}:
-            rows.extend(pull_solana(args.limit, holders_min, insider_max, args.show_rejects))
-        if args.chain in {"rh", "both"}:
-            rows.extend(pull_robinhood(args.limit, min_liq, args.show_rejects))
-        fresh = [r for r in rows if r["token"] not in seen]
+        for ck in chain_keys:
+            rows.extend(pull_chain(ck, args.limit, min_liq, args.show_rejects, min_mc))
+        rows.extend(watch_wallets(args.show_rejects, min_mc, chain_keys))
+        fresh = [r for r in rows if row_key(r) not in seen]
         for r in fresh:
-            seen.add(r["token"])
+            seen.add(row_key(r))
         save_seen(seen)
         print_table(fresh if (args.watch or seeded) else rows)
         if not seeded:
             print(
-                f"Seeded {len(seen)} tokens. Next new pass goes to Telegram."
+                f"Seeded {len(seen)} keys. Next new pass goes to Telegram."
                 if tg_ok
-                else f"Seeded {len(seen)} tokens."
+                else f"Seeded {len(seen)} keys."
             )
             seeded = True
             return
@@ -467,7 +508,7 @@ def main() -> int:
                 except Exception as e:
                     print(f"  telegram failed: {e}")
         print()
-        print("Filters hide mint/freeze/honeypot/hidden-owner/high tax. They do not stop a dump.")
+        print("Filter: DexScreener paid + market cap over $50k. Not a dump guarantee.")
 
     once()
     while args.watch:
